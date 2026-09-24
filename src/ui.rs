@@ -1430,8 +1430,8 @@ impl Recorder {
         dialog.set_close_response("no");
         let this = self.clone();
         dialog.connect_response(None, move |_, response| {
-            settings::set_bar_widget_offered();
             if response != "add" {
+                settings::set_bar_widget_offered();
                 return;
             }
             let (tx, rx) = async_channel::bounded(1);
@@ -1441,7 +1441,10 @@ impl Recorder {
             let this = this.clone();
             glib::spawn_future_local(async move {
                 match rx.recv().await {
-                    Ok(Ok(())) => this.toast("Added to the bar"),
+                    Ok(Ok(())) => {
+                        settings::set_bar_widget_offered();
+                        this.toast("Added to the bar");
+                    }
                     Ok(Err(message)) => {
                         this.toast(&format!("Could not add it to the bar: {message}"))
                     }

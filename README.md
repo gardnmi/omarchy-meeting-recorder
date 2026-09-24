@@ -207,6 +207,14 @@ omarchy plugin enable jankeesvw.meeting-recorder
 omarchy bar move jankeesvw.meeting-recorder --section right
 ```
 
+The shell discovers plugins asynchronously. If enabling immediately after a rescan says the plugin is not known, wait until `omarchy-shell shell listPlugins` includes `jankeesvw.meeting-recorder`, then run:
+
+```bash
+omarchy plugin enable jankeesvw.meeting-recorder --section right
+```
+
+This also recovers a failed first-start “Add to Bar” attempt in version 1.0.2, which leaves the widget linked but does not offer again on restart.
+
 ## Command line
 
 | Command | What it does |
