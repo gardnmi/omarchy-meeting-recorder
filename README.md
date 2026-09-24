@@ -249,6 +249,18 @@ Some providers expose only a generic title or a meeting code. Those identify the
 
 Run `omarchy-meeting-recorder detect-meetings` to inspect the detected providers and available titles without recording.
 
+## Automatic recording
+
+**Preferences → Start recording automatically** enables a background watcher for Zoom and Google Meet. This switch is off by default and independent of **Detect meeting title**. With title detection off, recordings use your manual name or the normal timestamp default. With it on, an available meeting name is suggested without overriding a name you typed.
+
+The watcher waits for one unambiguous meeting window in two consecutive checks. It opens the recorder if needed and leaves a busy recorder alone. Known home/join/ended screens are filtered, but detection is based on window metadata, not an authoritative joined-call signal: a titled preview can trigger recording. The selected Google Meet tab must be visible in a browser window; hidden tabs cannot be detected.
+
+Stop recording manually when finished. Leaving a call does not stop recording. Handled meetings are remembered for the desktop session, so manual Stop, switching browser tabs, and restarting the watcher do not restart the same call. A different Meet code or a closed/reopened window can trigger another recording. For named calls without a visible identifier, close and reopen the meeting window between calls. A meeting skipped because the recorder was busy is not retried automatically.
+
+The switch creates `omarchy-meeting-recorder-auto-record.service` in your user systemd configuration, using the current executable. It starts with the graphical session and runs independently of the recorder GUI. Turning it off stops detection without interrupting a recording. If a source-built executable moves, toggle the switch off and on from the new location.
+
+Use `omarchy-meeting-recorder auto-record --check` for read-only diagnostics and `journalctl --user -u omarchy-meeting-recorder-auto-record.service` for watcher errors.
+
 ## Command line
 
 | Command | What it does |
