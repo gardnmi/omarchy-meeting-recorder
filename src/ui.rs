@@ -224,6 +224,13 @@ impl Hub {
                 }
                 r.start();
             }
+            "auto-start" if matches!(r.state.get(), State::Idle | State::Done) => {
+                if r.state.get() == State::Done {
+                    r.ready();
+                }
+                r.apply_meeting_title((!title.is_empty()).then_some(title));
+                r.start();
+            }
             "stop" => r.stop(),
             "compact" => r.set_compact(!r.compact.get()),
             "pause" => r.toggle_pause(),
@@ -869,6 +876,37 @@ impl Recorder {
             .build();
         title_row.connect_active_notify(|row| settings::set_auto_detect_title(row.is_active()));
         group.add(&title_row);
+        let start_row = adw::SwitchRow::builder()
+            .title("Start recording automatically")
+            .subtitle("Open the recorder for detected Zoom or Google Meet windows, even while this app is closed. A preview screen can also trigger detection. Stop recording manually.")
+            .active(crate::auto_record::enabled())
+            .build();
+        group.add(&start_row);
+        let updating = Rc::new(Cell::new(false));
+        let weak = Rc::downgrade(self);
+        start_row.connect_active_notify(move |row| {
+            if updating.replace(true) {
+                return;
+            }
+            let enabled = row.is_active();
+            row.set_sensitive(false);
+            let row = row.clone();
+            let updating = updating.clone();
+            let weak = weak.clone();
+            glib::spawn_future_local(async move {
+                let result = gio::spawn_blocking(move || crate::auto_record::set_enabled(enabled))
+                    .await
+                    .unwrap_or_else(|_| Err("Could not change automatic recording".into()));
+                if let Err(message) = result {
+                    row.set_active(!enabled);
+                    if let Some(r) = weak.upgrade() {
+                        r.toast(&message);
+                    }
+                }
+                row.set_sensitive(true);
+                updating.set(false);
+            });
+        });
         page.add(&group);
         dialog.add(&page);
         dialog.present(Some(&self.window));
