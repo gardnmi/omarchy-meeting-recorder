@@ -17,6 +17,7 @@ mod meeting_detection;
 mod models;
 mod nemotron;
 mod player;
+mod room_identity;
 mod settings;
 mod theme;
 mod transcribe;

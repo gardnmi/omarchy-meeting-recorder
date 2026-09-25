@@ -42,10 +42,17 @@ impl Seen {
                     .iter()
                     .any(|c| c["address"].as_str() == Some(entry.window.as_str()))
         });
-        let Some(m) = meeting_detection::unique(clients) else {
+        let Some(mut m) = meeting_detection::unique(clients) else {
             self.pending = None;
             return None;
         };
+        crate::room_identity::augment(&mut m);
+        // Upgrade an old fallback suppression once, without extending its deadline.
+        if m.key != m.fallback_key
+            && let Some(entry) = self.handled.remove(&m.fallback_key)
+        {
+            self.handled.entry(m.key.clone()).or_insert(entry);
+        }
         if self.handled.contains_key(&m.key) {
             self.pending = None;
             return None;
@@ -403,6 +410,49 @@ mod tests {
         assert_eq!(seen.handled["call"].expires_at, 100 + SUPPRESSION_SECS);
         let restored = Seen::restore_at(&seen.saved("session"), "session", 200);
         assert_eq!(restored.handled["call"].expires_at, 100 + SUPPRESSION_SECS);
+    }
+
+    #[test]
+    fn same_title_rooms_are_distinct_and_renames_do_not_restart() {
+        for (first, second) in [
+            (
+                "chrome-meet.google.com__abc-defg-hij-Default",
+                "chrome-meet.google.com__klm-nopq-rst-Default",
+            ),
+            (
+                "chrome-app.zoom.us__wc_join_12345678901-Default",
+                "chrome-app.zoom.us__wc_join_98765432109-Default",
+            ),
+        ] {
+            let mut client =
+                serde_json::json!({"address":"0x1", "class":first, "title":"Daily sync"});
+            let mut seen = Seen::default();
+            assert!(seen.update_at(&[client.clone()], 100).is_none());
+            assert!(seen.update_at(&[client.clone()], 102).is_some());
+            client["title"] = "Renamed sync".into();
+            assert!(seen.update_at(&[client.clone()], 104).is_none());
+            client["title"] = "Daily sync".into();
+            client["class"] = second.into();
+            assert!(seen.update_at(&[client.clone()], 106).is_none());
+            assert!(seen.update_at(&[client], 108).is_some());
+        }
+    }
+
+    #[test]
+    fn upgrading_fallback_suppression_preserves_deadline() {
+        let client = web("abc-defg-hij");
+        let detected = meeting_detection::detect(&client).unwrap();
+        let mut seen = Seen::default();
+        seen.handled.insert(
+            detected.fallback_key.clone(),
+            Handled {
+                window: detected.window,
+                expires_at: 200,
+            },
+        );
+        assert!(seen.update_at(&[client], 100).is_none());
+        assert!(!seen.handled.contains_key(&detected.fallback_key));
+        assert_eq!(seen.handled[&detected.key].expires_at, 200);
     }
 
     #[test]

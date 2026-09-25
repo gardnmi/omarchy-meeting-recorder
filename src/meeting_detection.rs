@@ -7,6 +7,8 @@ use serde_json::Value;
 #[derive(Clone, Debug, PartialEq)]
 pub struct DetectedMeeting {
     pub key: String,
+    pub fallback_key: String,
+    pub room: Option<crate::room_identity::Room>,
     pub window: String,
     pub provider: &'static str,
     pub title: Option<String>,
@@ -41,7 +43,7 @@ fn browser(class: &str) -> bool {
     )
 }
 
-fn meet_code(text: &str) -> bool {
+pub(crate) fn meet_code(text: &str) -> bool {
     text.len() == 12
         && text.bytes().enumerate().all(|(i, c)| {
             if i == 3 || i == 8 {
@@ -89,10 +91,12 @@ pub fn detect(client: &Value) -> Option<DetectedMeeting> {
     if window.is_empty() || title.chars().any(char::is_control) || generic(title) {
         return None;
     }
-    let zoom_web = class
-        .strip_prefix("chrome-app.zoom.us__wc_join_")
-        .or_else(|| class.strip_prefix("chrome-app.zoom.us__wc_"))
-        .is_some_and(|suffix| suffix.starts_with(|c: char| c.is_ascii_digit()));
+    let class_room = crate::room_identity::from_class(class);
+    let zoom_web = class_room.as_ref().is_some_and(|r| r.provider == "Zoom")
+        || class
+            .strip_prefix("chrome-app.zoom.us__wc_join_")
+            .or_else(|| class.strip_prefix("chrome-app.zoom.us__wc_"))
+            .is_some_and(|suffix| suffix.starts_with(|c: char| c.is_ascii_digit()));
     let zoom_native = matches!(class, "zoom" | "Zoom" | "zoom.real")
         && (title == "Zoom Meeting" || title.ends_with(" - Zoom Meeting"));
     let (provider, name, identity) = if zoom_web || zoom_native {
@@ -130,12 +134,34 @@ pub fn detect(client: &Value) -> Option<DetectedMeeting> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.chars().take(200).collect());
-    Some(DetectedMeeting {
-        key: format!("{window}:{provider}:{identity}"),
+    let fallback_key = format!("{window}:{provider}:{identity}");
+    let mut meeting = DetectedMeeting {
+        key: fallback_key.clone(),
+        fallback_key,
+        room: None,
         window: window.into(),
         provider,
         title,
-    })
+    };
+    let room = if provider == "Google Meet" && meet_code(identity) {
+        Some(crate::room_identity::Room {
+            provider: provider.into(),
+            id: identity.into(),
+        })
+    } else {
+        class_room
+    };
+    if let Some(room) = room {
+        meeting.set_room(room);
+    }
+    Some(meeting)
+}
+
+impl DetectedMeeting {
+    pub fn set_room(&mut self, room: crate::room_identity::Room) {
+        self.key = format!("{}:{}:room:{}", self.window, self.provider, room.id);
+        self.room = Some(room);
+    }
 }
 
 pub fn clients() -> Result<Vec<Value>, String> {
@@ -278,6 +304,15 @@ mod tests {
         let b = client("zoom", "Zoom Meeting");
         assert!(unique(&[a.clone(), b]).is_none());
         assert!(unique(&[a]).is_some());
+    }
+    #[test]
+    fn current_meet_code_overrides_launch_room() {
+        let meeting = detect(&client(
+            "chrome-meet.google.com__abc-defg-hij-Default",
+            "Meet - klm-nopq-rst",
+        ))
+        .unwrap();
+        assert_eq!(meeting.room.unwrap().id, "klm-nopq-rst");
     }
     #[test]
     fn manual_titles_win_and_stale_suggestions_clear() {

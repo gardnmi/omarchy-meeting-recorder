@@ -755,6 +755,42 @@ impl Recorder {
             });
         });
         page.add(&group);
+        let links = adw::PreferencesGroup::builder()
+            .title("Meeting identity")
+            .description("Optional: apply a Google Meet or Zoom link to the single detected meeting. Only the room ID is saved, for two hours. Apply a new link when changing rooms. Native Zoom and named browser tabs may not expose an ID.")
+            .build();
+        let link = adw::EntryRow::builder().title("Meeting URL").build();
+        let apply = gtk::Button::builder()
+            .label("Apply")
+            .valign(gtk::Align::Center)
+            .build();
+        link.add_suffix(&apply);
+        let weak = Rc::downgrade(self);
+        let entry = link.clone();
+        apply.connect_clicked(move |button| {
+            button.set_sensitive(false);
+            let button = button.clone();
+            let entry = entry.clone();
+            let weak = weak.clone();
+            let text = entry.text().to_string();
+            glib::spawn_future_local(async move {
+                let result = gio::spawn_blocking(move || crate::room_identity::apply(&text))
+                    .await
+                    .unwrap_or_else(|_| Err("Could not apply meeting link".into()));
+                if let Some(r) = weak.upgrade() {
+                    match result {
+                        Ok(()) => {
+                            entry.set_text("");
+                            r.toast("Meeting room ID applied for two hours");
+                        }
+                        Err(message) => r.toast(&message),
+                    }
+                }
+                button.set_sensitive(true);
+            });
+        });
+        links.add(&link);
+        page.add(&links);
         dialog.add(&page);
         dialog.present(Some(&self.window));
     }
