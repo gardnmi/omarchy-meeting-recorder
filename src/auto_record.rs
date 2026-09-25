@@ -42,11 +42,10 @@ impl Seen {
                     .iter()
                     .any(|c| c["address"].as_str() == Some(entry.window.as_str()))
         });
-        let Some(mut m) = meeting_detection::unique(clients) else {
+        let Some(m) = meeting_detection::unique(clients) else {
             self.pending = None;
             return None;
         };
-        crate::room_identity::augment(&mut m);
         // Upgrade an old fallback suppression once, without extending its deadline.
         if m.key != m.fallback_key
             && let Some(entry) = self.handled.remove(&m.fallback_key)
