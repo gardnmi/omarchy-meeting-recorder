@@ -31,6 +31,12 @@ struct Seen {
 }
 
 impl Seen {
+    fn launch_failed(&mut self, key: &str, now: i64) {
+        if let Some(entry) = self.handled.get_mut(key) {
+            entry.expires_at = now.saturating_add(30);
+        }
+    }
+
     fn update(&mut self, clients: &[Value]) -> Option<DetectedMeeting> {
         self.update_at(clients, ipc::now())
     }
@@ -138,10 +144,39 @@ fn save_seen(text: &str) -> Result<(), String> {
     std::fs::rename(temp, path).map_err(|e| e.to_string())
 }
 
-fn start(title: Option<&str>) -> Result<(), String> {
+// Linux reports an atomically replaced executable with a " (deleted)" suffix.
+// Launch the installed replacement, never that procfs display name.
+fn installed_executable(path: std::path::PathBuf) -> Result<std::path::PathBuf, String> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    if path.is_file() {
+        return Ok(path);
+    }
+    if let Some(original) = path.as_os_str().as_bytes().strip_suffix(b" (deleted)") {
+        let replacement = std::path::PathBuf::from(std::ffi::OsString::from_vec(original.to_vec()));
+        if replacement.is_file() {
+            return Ok(replacement);
+        }
+    }
+    Err("Recorder executable is no longer installed".into())
+}
+
+fn executable() -> Result<std::path::PathBuf, String> {
+    installed_executable(std::env::current_exe().map_err(|e| e.to_string())?)
+}
+
+enum StartOutcome {
+    Started,
+    Busy,
+    LaunchFailed(String),
+}
+
+fn start(title: Option<&str>) -> Result<StartOutcome, String> {
     let mut status = ipc::snapshot();
     if status.is_err() {
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let exe = match executable() {
+            Ok(exe) => exe,
+            Err(e) => return Ok(StartOutcome::LaunchFailed(e)),
+        };
         // A separate unit keeps the GUI/recording alive when the user disables
         // the watcher (systemd otherwise kills all of the watcher's children).
         let output = Command::new("systemd-run")
@@ -154,13 +189,16 @@ fn start(title: Option<&str>) -> Result<(), String> {
                 "--",
             ])
             .arg(exe)
-            .output()
-            .map_err(|e| e.to_string())?;
+            .output();
+        let output = match output {
+            Ok(output) => output,
+            Err(e) => return Ok(StartOutcome::LaunchFailed(e.to_string())),
+        };
         if !output.status.success() {
-            return Err(format!(
+            return Ok(StartOutcome::LaunchFailed(format!(
                 "Could not open the recorder: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
-            ));
+            )));
         }
         for _ in 0..20 {
             thread::sleep(Duration::from_millis(250));
@@ -172,7 +210,7 @@ fn start(title: Option<&str>) -> Result<(), String> {
     }
     let status = status.map_err(|e| format!("Recorder did not become ready: {e}"))?;
     if !matches!(status["state"].as_str(), Some("idle" | "done")) {
-        return Err("Recorder is busy; leaving the existing recording unchanged".into());
+        return Ok(StartOutcome::Busy);
     }
     if !ipc::auto_start(title) {
         return Err("Could not send the recording command".into());
@@ -180,7 +218,7 @@ fn start(title: Option<&str>) -> Result<(), String> {
     for _ in 0..5 {
         let status = ipc::snapshot()?;
         if matches!(status["state"].as_str(), Some("recording" | "paused")) {
-            return Ok(());
+            return Ok(StartOutcome::Started);
         }
         thread::sleep(Duration::from_millis(200));
     }
@@ -239,7 +277,23 @@ pub fn run(args: &[String]) -> glib::ExitCode {
                 }
                 if let Some(m) = detected {
                     match start(m.title.as_deref()) {
-                        Ok(()) => eprintln!("Automatic recording started ({})", m.provider),
+                        Ok(StartOutcome::Started) => {
+                            eprintln!("Automatic recording started ({})", m.provider)
+                        }
+                        Ok(StartOutcome::Busy) => eprintln!(
+                            "Automatic recording: Recorder is busy; leaving the existing recording unchanged"
+                        ),
+                        Ok(StartOutcome::LaunchFailed(e)) => {
+                            // No recording command was sent. Retry a failed launch
+                            // after a short cooldown, not the handled-call timeout.
+                            seen.launch_failed(&m.key, ipc::now());
+                            saved = seen.saved(&session);
+                            if let Err(error) = save_seen(&saved) {
+                                eprintln!("Could not save launch retry: {error}");
+                                return glib::ExitCode::FAILURE;
+                            }
+                            eprintln!("Automatic recording: {e}; retrying in 30 seconds");
+                        }
                         Err(e) => eprintln!("Automatic recording: {e}"),
                     }
                 }
@@ -280,7 +334,7 @@ pub fn set_enabled(enabled: bool) -> Result<(), String> {
     if glib::find_program_in_path("hyprctl").is_none() {
         return Err("Automatic recording requires Hyprland".into());
     }
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = executable()?;
     let path = exe
         .to_str()
         .ok_or("The application path is not valid UTF-8")?;
@@ -317,6 +371,27 @@ mod tests {
     use super::*;
     fn web(code: &str) -> Value {
         serde_json::json!({"address":"0x1","class":"chromium","title":format!("Meet - {code} - Chromium")})
+    }
+    #[test]
+    fn replaced_executable_uses_installed_path() {
+        let real = std::env::current_exe().unwrap();
+        assert_eq!(installed_executable(real.clone()).unwrap(), real);
+        let mut deleted = real.clone().into_os_string();
+        deleted.push(" (deleted)");
+        assert_eq!(installed_executable(deleted.into()).unwrap(), real);
+        assert!(installed_executable(real.join("missing (deleted)")).is_err());
+    }
+    #[test]
+    fn failed_launch_retries_after_cooldown_and_restart() {
+        let mut seen = Seen::default();
+        let clients = [web("Team sync")];
+        seen.update_at(&clients, 100);
+        let meeting = seen.update_at(&clients, 102).unwrap();
+        seen.launch_failed(&meeting.key, 103);
+        let mut restored = Seen::restore_at(&seen.saved("session"), "session", 104);
+        assert!(restored.update_at(&clients, 132).is_none());
+        assert!(restored.update_at(&clients, 133).is_none());
+        assert!(restored.update_at(&clients, 135).is_some());
     }
     #[test]
     fn starts_a_stable_meeting_once_even_after_tab_switch_or_restart() {
