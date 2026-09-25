@@ -290,6 +290,19 @@ mod tests {
         assert!(seen.update(&[web("klm-nopq-rst")]).is_some());
     }
     #[test]
+    fn different_named_meetings_in_one_browser_window_can_start() {
+        let mut seen = Seen::default();
+        seen.update(&[web("First planning call")]);
+        assert!(seen.update(&[web("First planning call")]).is_some());
+        let mut seen = Seen::restore(&seen.saved("session"), "session");
+        assert!(seen.update(&[web("Next planning call")]).is_none());
+        assert!(seen.update(&[web("Next planning call")]).is_some());
+        assert!(seen.update(&[web("Next planning call")]).is_none());
+        // Switching back to a previously handled call must not restart it.
+        assert!(seen.update(&[web("First planning call")]).is_none());
+    }
+
+    #[test]
     fn ambiguous_windows_never_auto_start() {
         let mut a = web("abc-defg-hij");
         let b = web("klm-nopq-rst");

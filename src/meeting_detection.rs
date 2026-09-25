@@ -117,12 +117,13 @@ pub fn detect(client: &Value) -> Option<DetectedMeeting> {
         if generic(name) {
             return None;
         }
-        // A code identifies a call even when several calls reuse one browser
-        // window. It is not a meeting name, so do not fill the name with it.
+        // Use the visible code or name as the identity, not the browser class:
+        // unrelated named meetings often reuse the same browser window. A code
+        // is not a meeting name, so do not fill the name field with it.
         (
             "Google Meet",
             if meet_code(name) { None } else { Some(name) },
-            if meet_code(name) { name } else { class },
+            name,
         )
     };
     let title = name
