@@ -93,3 +93,11 @@ pub fn auto_detect_title() -> bool {
 pub fn set_auto_detect_title(enabled: bool) {
     save("auto_detect_title", if enabled { "yes" } else { "no" });
 }
+
+/// Stop only on conservative meeting-end hints; default off.
+pub fn auto_stop() -> bool {
+    load()["auto_stop"].as_str() == Some("yes")
+}
+pub fn set_auto_stop(enabled: bool) {
+    save("auto_stop", if enabled { "yes" } else { "no" });
+}

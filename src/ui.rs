@@ -309,6 +309,7 @@ struct Recorder {
     compact_button: gtk::Button,
     title_row: adw::EntryRow,
     suggested_title: RefCell<Option<String>>,
+    recording_generation: Cell<u64>,
     format_row: adw::ComboRow,
     language_row: adw::ComboRow,
     animation: TranscribeAnimation,
@@ -464,6 +465,12 @@ impl Recorder {
                 .unwrap_or(0) as u32,
         );
         group.add(&title_row);
+        let stop_row = adw::SwitchRow::builder()
+            .title("Stop recording automatically")
+            .subtitle("Associate new recordings with a single detected meeting. Stop after its window closes or shows a recognized ended state for 30 seconds. Leaving Google Meet may not change its title: close the meeting window or stop manually.")
+            .active(settings::auto_stop()).build();
+        stop_row.connect_active_notify(|row| settings::set_auto_stop(row.is_active()));
+        group.add(&stop_row);
         group.add(&format_row);
         group.add(&language_row);
         content.append(&group);
@@ -784,6 +791,7 @@ impl Recorder {
             compact_button,
             title_row,
             suggested_title: RefCell::default(),
+            recording_generation: Cell::new(0),
             format_row,
             language_row,
             animation,
@@ -876,9 +884,15 @@ impl Recorder {
             .build();
         title_row.connect_active_notify(|row| settings::set_auto_detect_title(row.is_active()));
         group.add(&title_row);
+        let stop_row = adw::SwitchRow::builder()
+            .title("Stop recording automatically")
+            .subtitle("Associate new recordings with a single detected meeting. Stop after its window closes or shows a recognized ended state for 30 seconds. Leaving Google Meet may not change its title: close the meeting window or stop manually.")
+            .active(settings::auto_stop()).build();
+        stop_row.connect_active_notify(|row| settings::set_auto_stop(row.is_active()));
+        group.add(&stop_row);
         let start_row = adw::SwitchRow::builder()
             .title("Start recording automatically")
-            .subtitle("Open the recorder for detected Zoom or Google Meet windows, even while this app is closed. Repeats are suppressed for two hours. An open meeting or preview tab can trigger again afterward. Stop recording manually.")
+            .subtitle("Open the recorder for detected Zoom or Google Meet windows, even while this app is closed. Repeats are suppressed for two hours. An open meeting or preview tab can trigger again afterward. Stop manually unless automatic stopping is enabled.")
             .active(crate::auto_record::enabled())
             .build();
         group.add(&start_row);
@@ -2040,6 +2054,48 @@ impl Recorder {
         self.update_model_banner();
     }
 
+    fn follow_meeting_end(self: &Rc<Self>, generation: u64) {
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Ok(Ok(clients)) = gio::spawn_blocking(crate::meeting_detection::clients).await
+            else {
+                return;
+            };
+            let Some(mut watch) = crate::auto_stop::Watch::bind(&clients) else {
+                return;
+            };
+            loop {
+                glib::timeout_future_seconds(2).await;
+                let Some(r) = weak.upgrade() else {
+                    return;
+                };
+                if r.recording_generation.get() != generation
+                    || !matches!(r.state.get(), State::Recording)
+                    || !settings::auto_stop()
+                {
+                    return;
+                }
+                drop(r);
+                let result = gio::spawn_blocking(crate::meeting_detection::clients).await;
+                let clients = result.ok().and_then(Result::ok);
+                if watch.observe(clients.as_deref(), std::time::Instant::now()) {
+                    let Some(r) = weak.upgrade() else {
+                        return;
+                    };
+                    // A manual Stop/new recording can happen while the query runs.
+                    if r.recording_generation.get() == generation
+                        && matches!(r.state.get(), State::Recording)
+                        && settings::auto_stop()
+                    {
+                        r.toast("Meeting ended: stopping recording");
+                        r.stop();
+                    }
+                    return;
+                }
+            }
+        });
+    }
+
     fn start(self: &Rc<Self>) {
         // One recording at a time: the audio sources are shared by all windows.
         if let Some(other) = self.hub.upgrade().and_then(|hub| hub.recording())
@@ -2087,6 +2143,11 @@ impl Recorder {
         self.timer.set_label("00:00");
         self.compact_timer.set_label("00:00");
         self.set_state(State::Recording);
+        self.recording_generation
+            .set(self.recording_generation.get().wrapping_add(1));
+        if settings::auto_stop() {
+            self.follow_meeting_end(self.recording_generation.get());
+        }
     }
 
     fn stop(self: &Rc<Self>) {

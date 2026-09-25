@@ -7,6 +7,7 @@ mod agent;
 mod animation;
 mod audio;
 mod auto_record;
+mod auto_stop;
 mod bar_widget;
 mod chapters;
 mod diarize;
