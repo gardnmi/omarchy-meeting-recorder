@@ -725,7 +725,7 @@ impl Recorder {
         group.add(&title_row);
         let start_row = adw::SwitchRow::builder()
             .title("Start recording automatically")
-            .subtitle("Open the recorder for detected Zoom or Google Meet windows, even while this app is closed. A preview screen can also trigger detection. Stop recording manually.")
+            .subtitle("Open the recorder for detected Zoom or Google Meet windows, even while this app is closed. Repeats are suppressed for two hours. An open meeting or preview tab can trigger again afterward. Stop recording manually.")
             .active(crate::auto_record::enabled())
             .build();
         group.add(&start_row);

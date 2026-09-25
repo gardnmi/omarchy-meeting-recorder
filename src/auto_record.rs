@@ -15,21 +15,32 @@ use gtk::glib;
 use serde_json::Value;
 
 const SERVICE: &str = "omarchy-meeting-recorder-auto-record.service";
+const SUPPRESSION_SECS: i64 = 2 * 60 * 60;
+
+struct Handled {
+    window: String,
+    expires_at: i64,
+}
 
 #[derive(Default)]
 struct Seen {
     pending: Option<(String, Option<String>, usize)>,
-    // Retain handled calls while their browser/window lives, including when
-    // another tab hides them. Manual Stop and watcher restarts must not restart.
-    handled: HashMap<String, String>,
+    // Suppress repeats for two hours, including tab switches and watcher
+    // restarts. Closing a window releases its entries sooner.
+    handled: HashMap<String, Handled>,
 }
 
 impl Seen {
     fn update(&mut self, clients: &[Value]) -> Option<DetectedMeeting> {
-        self.handled.retain(|_, window| {
-            clients
-                .iter()
-                .any(|c| c["address"].as_str() == Some(window))
+        self.update_at(clients, ipc::now())
+    }
+
+    fn update_at(&mut self, clients: &[Value], now: i64) -> Option<DetectedMeeting> {
+        self.handled.retain(|_, entry| {
+            entry.expires_at > now
+                && clients
+                    .iter()
+                    .any(|c| c["address"].as_str() == Some(entry.window.as_str()))
         });
         let Some(m) = meeting_detection::unique(clients) else {
             self.pending = None;
@@ -47,20 +58,45 @@ impl Seen {
         if count < 2 {
             return None;
         }
-        self.handled.insert(m.key.clone(), m.window.clone());
+        self.handled.insert(
+            m.key.clone(),
+            Handled {
+                window: m.window.clone(),
+                expires_at: now.saturating_add(SUPPRESSION_SECS),
+            },
+        );
         self.pending = None;
         Some(m)
     }
 
     fn restore(text: &str, session: &str) -> Self {
+        Self::restore_at(text, session, ipc::now())
+    }
+
+    fn restore_at(text: &str, session: &str, now: i64) -> Self {
         let mut seen = Self::default();
         if let Ok(value) = serde_json::from_str::<Value>(text)
             && value["session"].as_str() == Some(session)
             && let Some(handled) = value["handled"].as_object()
         {
-            for (key, window) in handled {
-                if let Some(window) = window.as_str() {
-                    seen.handled.insert(key.clone(), window.into());
+            for (key, value) in handled {
+                // Migrate the old untimed format once, without immediately
+                // restarting a meeting after upgrading the watcher.
+                let entry = if let Some(window) = value.as_str() {
+                    Some((window, now.saturating_add(SUPPRESSION_SECS)))
+                } else {
+                    value["window"].as_str().zip(value["expires_at"].as_i64())
+                };
+                if let Some((window, expires_at)) = entry
+                    && expires_at > now
+                {
+                    seen.handled.insert(
+                        key.clone(),
+                        Handled {
+                            window: window.into(),
+                            expires_at: expires_at.min(now.saturating_add(SUPPRESSION_SECS)),
+                        },
+                    );
                 }
             }
         }
@@ -68,7 +104,17 @@ impl Seen {
     }
 
     fn saved(&self, session: &str) -> String {
-        serde_json::json!({"session":session,"handled":self.handled}).to_string()
+        let handled: serde_json::Map<String, Value> = self
+            .handled
+            .iter()
+            .map(|(key, entry)| {
+                (
+                    key.clone(),
+                    serde_json::json!({"window":entry.window,"expires_at":entry.expires_at}),
+                )
+            })
+            .collect();
+        serde_json::json!({"session":session,"handled":handled}).to_string()
     }
 }
 
@@ -167,7 +213,8 @@ pub fn run(args: &[String]) -> glib::ExitCode {
     let path = glib::user_runtime_dir().join("omarchy-meeting-recorder-detected.json");
     let previous = std::fs::read_to_string(path).unwrap_or_default();
     let mut seen = Seen::restore(&previous, &session);
-    let mut saved = seen.saved(&session);
+    // Persist migrations/expired entries on the first successful window query.
+    let mut saved = previous;
     let mut last_error = String::new();
     loop {
         match meeting_detection::clients() {
@@ -300,6 +347,62 @@ mod tests {
         assert!(seen.update(&[web("Next planning call")]).is_none());
         // Switching back to a previously handled call must not restart it.
         assert!(seen.update(&[web("First planning call")]).is_none());
+    }
+
+    #[test]
+    fn suppression_expires_after_two_hours_without_sliding_on_observation() {
+        let mut seen = Seen::default();
+        let clients = [web("Daily meeting")];
+        assert!(seen.update_at(&clients, 100).is_none());
+        assert!(seen.update_at(&clients, 102).is_some());
+        assert!(
+            seen.update_at(&clients, 102 + SUPPRESSION_SECS - 1)
+                .is_none()
+        );
+        // Expiry still requires two stable observations before another attempt.
+        assert!(seen.update_at(&clients, 102 + SUPPRESSION_SECS).is_none());
+        assert!(seen.update_at(&clients, 104 + SUPPRESSION_SECS).is_some());
+        assert!(seen.update_at(&clients, 106 + SUPPRESSION_SECS).is_none());
+    }
+
+    #[test]
+    fn restarts_preserve_expiry_and_drop_expired_entries() {
+        let clients = [web("Daily meeting")];
+        let mut seen = Seen::default();
+        seen.update_at(&clients, 100);
+        seen.update_at(&clients, 102);
+        let saved = seen.saved("session");
+        let mut restored = Seen::restore_at(&saved, "session", 200);
+        assert!(
+            restored
+                .update_at(&clients, 102 + SUPPRESSION_SECS - 1)
+                .is_none()
+        );
+        assert!(
+            restored
+                .update_at(&clients, 102 + SUPPRESSION_SECS)
+                .is_none()
+        );
+        assert!(
+            restored
+                .update_at(&clients, 104 + SUPPRESSION_SECS)
+                .is_some()
+        );
+        assert!(
+            Seen::restore_at(&saved, "session", 102 + SUPPRESSION_SECS)
+                .handled
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn old_state_migrates_once_and_invalid_expiries_are_ignored() {
+        let old = r#"{"session":"session","handled":{"call":"0x1","bad":{"window":"0x1","expires_at":"invalid"}}}"#;
+        let seen = Seen::restore_at(old, "session", 100);
+        assert_eq!(seen.handled.len(), 1);
+        assert_eq!(seen.handled["call"].expires_at, 100 + SUPPRESSION_SECS);
+        let restored = Seen::restore_at(&seen.saved("session"), "session", 200);
+        assert_eq!(restored.handled["call"].expires_at, 100 + SUPPRESSION_SECS);
     }
 
     #[test]
