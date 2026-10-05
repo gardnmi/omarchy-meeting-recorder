@@ -921,7 +921,9 @@ impl Recorder {
     }
 
     fn apply_meeting_title(&self, title: Option<&str>) {
-        if self.state.get() != State::Idle || !settings::auto_detect_title() {
+        if !matches!(self.state.get(), State::Idle | State::Recording)
+            || !settings::auto_detect_title()
+        {
             return;
         }
         let next = crate::meeting_detection::suggested_title(
@@ -945,7 +947,9 @@ impl Recorder {
                     continue;
                 }
                 let result = gio::spawn_blocking(crate::meeting_detection::clients).await;
-                if let Ok(Ok(clients)) = result {
+                if let Ok(Ok(clients)) = result
+                    && r.state.get() == State::Idle
+                {
                     let detected = crate::meeting_detection::unique(&clients);
                     r.apply_meeting_title(detected.as_ref().and_then(|m| m.title.as_deref()));
                 }
@@ -2054,6 +2058,39 @@ impl Recorder {
         });
     }
 
+    fn follow_recording_title(self: &Rc<Self>, generation: u64) {
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Ok(Ok(mut clients)) = gio::spawn_blocking(crate::meeting_detection::clients).await
+            else {
+                return;
+            };
+            let Some(bound) = crate::meeting_detection::unique(&clients) else {
+                return;
+            };
+            loop {
+                let Some(r) = weak.upgrade() else { return };
+                if r.recording_generation.get() != generation
+                    || r.state.get() != State::Recording
+                    || !settings::auto_detect_title()
+                {
+                    return;
+                }
+                if let Some(title) = crate::meeting_detection::recording_title(&bound, &clients) {
+                    r.apply_meeting_title(Some(&title));
+                }
+                drop(r);
+                glib::timeout_future_seconds(2).await;
+                // A failed query supplies no suggestion, retaining the last name.
+                clients = gio::spawn_blocking(crate::meeting_detection::clients)
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_default();
+            }
+        });
+    }
+
     fn start(self: &Rc<Self>) {
         // One recording at a time: the audio sources are shared by all windows.
         if let Some(other) = self.hub.upgrade().and_then(|hub| hub.recording())
@@ -2069,6 +2106,7 @@ impl Recorder {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|_| "Meeting".to_owned());
             self.title_row.set_text(&title);
+            *self.suggested_title.borrow_mut() = Some(title);
         }
         self.paused.set(false);
         self.paused_secs.set(0);
@@ -2103,6 +2141,9 @@ impl Recorder {
         self.set_state(State::Recording);
         self.recording_generation
             .set(self.recording_generation.get().wrapping_add(1));
+        if settings::auto_detect_title() {
+            self.follow_recording_title(self.recording_generation.get());
+        }
         if settings::auto_stop() {
             self.follow_meeting_end(self.recording_generation.get());
         }

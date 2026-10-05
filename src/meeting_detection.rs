@@ -102,7 +102,10 @@ pub fn detect(client: &Value) -> Option<DetectedMeeting> {
     let (provider, name, identity) = if zoom_web || zoom_native {
         (
             "Zoom",
-            if title == "Zoom Meeting" {
+            if matches!(
+                title.to_ascii_lowercase().as_str(),
+                "zoom meeting" | "zoom meeting on web" | "open zoom on web"
+            ) {
                 None
             } else {
                 Some(title.strip_suffix(" - Zoom Meeting").unwrap_or(title))
@@ -203,6 +206,15 @@ pub fn suggested_title(
     (current != next).then(|| next.to_owned())
 }
 
+/// During recording, only follow the bound meeting and keep the existing name
+/// if its topic disappears or another meeting takes its place.
+pub fn recording_title(bound: &DetectedMeeting, clients: &[Value]) -> Option<String> {
+    let meeting = unique(clients)?;
+    (meeting.key == bound.key)
+        .then_some(meeting.title)
+        .flatten()
+}
+
 pub fn check() -> gtk::glib::ExitCode {
     match clients() {
         Ok(clients) => {
@@ -248,6 +260,47 @@ mod tests {
         );
         assert_eq!(detect(&client("zoom", "Zoom Meeting")).unwrap().title, None);
         assert!(detect(&client("chromium", "Zoom docs")).is_none());
+    }
+    #[test]
+    fn zoom_web_placeholder_can_resolve_to_a_topic_in_the_same_recording() {
+        let class = "chrome-app.zoom.us__wc_join_123-Default";
+        for placeholder in ["Zoom meeting on web", "Open Zoom on web - Chromium"] {
+            let bound = detect(&client(class, placeholder)).unwrap();
+            assert_eq!(bound.title, None);
+            assert_eq!(recording_title(&bound, &[client(class, placeholder)]), None);
+            let topic = client(class, "Data - Standup and PR Review");
+            assert_eq!(
+                recording_title(&bound, &[topic.clone()]).as_deref(),
+                Some("Data - Standup and PR Review")
+            );
+            let resolved = recording_title(&bound, &[topic.clone()]);
+            assert_eq!(
+                suggested_title("Meeting 09:30", Some("Meeting 09:30"), resolved.as_deref()),
+                resolved
+            );
+            assert_eq!(
+                suggested_title("My notes", Some("Meeting 09:30"), resolved.as_deref()),
+                None
+            );
+            assert_eq!(recording_title(&bound, &[]), None);
+            assert_eq!(
+                recording_title(&bound, &[topic, client("zoom", "Zoom Meeting")]),
+                None
+            );
+            assert_eq!(
+                recording_title(
+                    &bound,
+                    &[client(
+                        "chrome-app.zoom.us__wc_join_456-Default",
+                        "Other call"
+                    )]
+                ),
+                None
+            );
+            let mut reopened = client(class, "Data - Standup and PR Review");
+            reopened["address"] = "0x2".into();
+            assert_eq!(recording_title(&bound, &[reopened]), None);
+        }
     }
     #[test]
     fn google_meet_web_app_and_visible_browser_tab() {
