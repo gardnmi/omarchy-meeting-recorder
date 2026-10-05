@@ -15,25 +15,25 @@ use gtk::glib;
 use serde_json::Value;
 
 const SERVICE: &str = "omarchy-meeting-recorder-auto-record.service";
-const SUPPRESSION_SECS: i64 = 2 * 60 * 60;
+const LAUNCH_RETRY_SECS: i64 = 30;
 
 struct Handled {
     window: String,
-    expires_at: i64,
+    retry_after: Option<i64>,
 }
 
 #[derive(Default)]
 struct Seen {
     pending: Option<(String, Option<String>, usize)>,
-    // Suppress repeats for two hours, including tab switches and watcher
-    // restarts. Closing a window releases its entries sooner.
+    // Suppress repeats for the lifetime of the meeting window, including tab
+    // switches and watcher restarts. Only definite launch failures expire.
     handled: HashMap<String, Handled>,
 }
 
 impl Seen {
     fn launch_failed(&mut self, key: &str, now: i64) {
         if let Some(entry) = self.handled.get_mut(key) {
-            entry.expires_at = now.saturating_add(30);
+            entry.retry_after = Some(now.saturating_add(LAUNCH_RETRY_SECS));
         }
     }
 
@@ -43,7 +43,7 @@ impl Seen {
 
     fn update_at(&mut self, clients: &[Value], now: i64) -> Option<DetectedMeeting> {
         self.handled.retain(|_, entry| {
-            entry.expires_at > now
+            entry.retry_after.is_none_or(|retry| retry > now)
                 && clients
                     .iter()
                     .any(|c| c["address"].as_str() == Some(entry.window.as_str()))
@@ -52,7 +52,7 @@ impl Seen {
             self.pending = None;
             return None;
         };
-        // Upgrade an old fallback suppression once, without extending its deadline.
+        // Upgrade an old fallback suppression without changing its retry policy.
         if m.key != m.fallback_key
             && let Some(entry) = self.handled.remove(&m.fallback_key)
         {
@@ -74,7 +74,7 @@ impl Seen {
             m.key.clone(),
             Handled {
                 window: m.window.clone(),
-                expires_at: now.saturating_add(SUPPRESSION_SECS),
+                retry_after: None,
             },
         );
         self.pending = None;
@@ -92,21 +92,30 @@ impl Seen {
             && let Some(handled) = value["handled"].as_object()
         {
             for (key, value) in handled {
-                // Migrate the old untimed format once, without immediately
-                // restarting a meeting after upgrading the watcher.
-                let entry = if let Some(window) = value.as_str() {
-                    Some((window, now.saturating_add(SUPPRESSION_SECS)))
-                } else {
-                    value["window"].as_str().zip(value["expires_at"].as_i64())
-                };
-                if let Some((window, expires_at)) = entry
-                    && expires_at > now
-                {
+                // Old two-hour deadlines are deliberately discarded: an expired
+                // entry may still belong to a long call the user already stopped.
+                let entry = value.as_str().map(|window| (window, None));
+                let entry = entry.or_else(|| {
+                    let window = value["window"].as_str()?;
+                    if value.get("retry_after").is_some() {
+                        let retry = match &value["retry_after"] {
+                            Value::Null => None,
+                            value => {
+                                Some(value.as_i64()?.min(now.saturating_add(LAUNCH_RETRY_SECS)))
+                            }
+                        };
+                        Some((window, retry))
+                    } else {
+                        value["expires_at"].as_i64()?;
+                        Some((window, None))
+                    }
+                });
+                if let Some((window, retry_after)) = entry {
                     seen.handled.insert(
                         key.clone(),
                         Handled {
                             window: window.into(),
-                            expires_at: expires_at.min(now.saturating_add(SUPPRESSION_SECS)),
+                            retry_after,
                         },
                     );
                 }
@@ -122,7 +131,7 @@ impl Seen {
             .map(|(key, entry)| {
                 (
                     key.clone(),
-                    serde_json::json!({"window":entry.window,"expires_at":entry.expires_at}),
+                    serde_json::json!({"window":entry.window,"retry_after":entry.retry_after}),
                 )
             })
             .collect();
@@ -257,7 +266,7 @@ pub fn run(args: &[String]) -> glib::ExitCode {
     let path = glib::user_runtime_dir().join("omarchy-meeting-recorder-detected.json");
     let previous = std::fs::read_to_string(path).unwrap_or_default();
     let mut seen = Seen::restore(&previous, &session);
-    // Persist migrations/expired entries on the first successful window query.
+    // Persist migrations/closed windows on the first successful window query.
     let mut saved = previous;
     let mut last_error = String::new();
     loop {
@@ -285,7 +294,7 @@ pub fn run(args: &[String]) -> glib::ExitCode {
                         ),
                         Ok(StartOutcome::LaunchFailed(e)) => {
                             // No recording command was sent. Retry a failed launch
-                            // after a short cooldown, not the handled-call timeout.
+                            // after a short cooldown; handled calls have no timeout.
                             seen.launch_failed(&m.key, ipc::now());
                             saved = seen.saved(&session);
                             if let Err(error) = save_seen(&saved) {
@@ -431,59 +440,49 @@ mod tests {
     }
 
     #[test]
-    fn suppression_expires_after_two_hours_without_sliding_on_observation() {
-        let mut seen = Seen::default();
+    fn long_calls_stay_suppressed_across_restarts_and_tab_switches() {
         let clients = [web("Daily meeting")];
+        let mut seen = Seen::default();
         assert!(seen.update_at(&clients, 100).is_none());
         assert!(seen.update_at(&clients, 102).is_some());
-        assert!(
-            seen.update_at(&clients, 102 + SUPPRESSION_SECS - 1)
-                .is_none()
-        );
-        // Expiry still requires two stable observations before another attempt.
-        assert!(seen.update_at(&clients, 102 + SUPPRESSION_SECS).is_none());
-        assert!(seen.update_at(&clients, 104 + SUPPRESSION_SECS).is_some());
-        assert!(seen.update_at(&clients, 106 + SUPPRESSION_SECS).is_none());
+        for now in [7302, 7304, 24 * 60 * 60, 7 * 24 * 60 * 60] {
+            assert!(seen.update_at(&clients, now).is_none());
+            let saved = seen.saved("session");
+            seen = Seen::restore_at(&saved, "session", now + 1);
+            assert!(seen.update_at(&clients, now + 2).is_none());
+            let mut tab = clients[0].clone();
+            tab["title"] = "Inbox - Chromium".into();
+            assert!(seen.update_at(&[tab], now + 3).is_none());
+            assert!(seen.update_at(&clients, now + 4).is_none());
+            assert_eq!(seen.saved("session"), saved);
+        }
+        // Closing the meeting window, unlike closing the recorder, releases it.
+        seen.update_at(&[], 8 * 24 * 60 * 60);
+        assert!(seen.update_at(&clients, 8 * 24 * 60 * 60 + 2).is_none());
+        assert!(seen.update_at(&clients, 8 * 24 * 60 * 60 + 4).is_some());
     }
 
     #[test]
-    fn restarts_preserve_expiry_and_drop_expired_entries() {
-        let clients = [web("Daily meeting")];
-        let mut seen = Seen::default();
-        seen.update_at(&clients, 100);
-        seen.update_at(&clients, 102);
-        let saved = seen.saved("session");
-        let mut restored = Seen::restore_at(&saved, "session", 200);
-        assert!(
-            restored
-                .update_at(&clients, 102 + SUPPRESSION_SECS - 1)
-                .is_none()
-        );
-        assert!(
-            restored
-                .update_at(&clients, 102 + SUPPRESSION_SECS)
-                .is_none()
-        );
-        assert!(
-            restored
-                .update_at(&clients, 104 + SUPPRESSION_SECS)
-                .is_some()
-        );
-        assert!(
-            Seen::restore_at(&saved, "session", 102 + SUPPRESSION_SECS)
-                .handled
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn old_state_migrates_once_and_invalid_expiries_are_ignored() {
-        let old = r#"{"session":"session","handled":{"call":"0x1","bad":{"window":"0x1","expires_at":"invalid"}}}"#;
-        let seen = Seen::restore_at(old, "session", 100);
-        assert_eq!(seen.handled.len(), 1);
-        assert_eq!(seen.handled["call"].expires_at, 100 + SUPPRESSION_SECS);
-        let restored = Seen::restore_at(&seen.saved("session"), "session", 200);
-        assert_eq!(restored.handled["call"].expires_at, 100 + SUPPRESSION_SECS);
+    fn old_deadlines_migrate_without_restarting_a_long_call() {
+        let client = web("Daily meeting");
+        let key = meeting_detection::detect(&client).unwrap().key;
+        for entry in [
+            serde_json::json!("0x1"),
+            serde_json::json!({"window":"0x1", "expires_at":200}),
+            serde_json::json!({"window":"0x1", "expires_at":10000}),
+        ] {
+            let old = serde_json::json!({"session":"session", "handled":{key.clone():entry}});
+            let mut seen = Seen::restore_at(&old.to_string(), "session", 8000);
+            assert_eq!(seen.handled.len(), 1);
+            assert_eq!(seen.handled[&key].retry_after, None);
+            assert!(seen.update_at(&[client.clone()], 8002).is_none());
+            let mut restored = Seen::restore_at(&seen.saved("session"), "session", 20000);
+            assert!(restored.update_at(&[client.clone()], 20002).is_none());
+            assert!(restored.update_at(&[], 20004).is_none());
+            assert!(restored.handled.is_empty());
+        }
+        let invalid = r#"{"session":"session","handled":{"bad":{"window":"0x1","expires_at":"invalid"},"bad_retry":{"window":"0x1","retry_after":"invalid"}}}"#;
+        assert!(Seen::restore_at(invalid, "session", 100).handled.is_empty());
     }
 
     #[test]
@@ -513,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn upgrading_fallback_suppression_preserves_deadline() {
+    fn upgrading_fallback_suppression_preserves_retry_deadline() {
         let client = web("abc-defg-hij");
         let detected = meeting_detection::detect(&client).unwrap();
         let mut seen = Seen::default();
@@ -521,12 +520,12 @@ mod tests {
             detected.fallback_key.clone(),
             Handled {
                 window: detected.window,
-                expires_at: 200,
+                retry_after: Some(200),
             },
         );
         assert!(seen.update_at(&[client], 100).is_none());
         assert!(!seen.handled.contains_key(&detected.fallback_key));
-        assert_eq!(seen.handled[&detected.key].expires_at, 200);
+        assert_eq!(seen.handled[&detected.key].retry_after, Some(200));
     }
 
     #[test]
