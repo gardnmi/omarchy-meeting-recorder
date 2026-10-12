@@ -2186,10 +2186,10 @@ impl Recorder {
                 );
                 let audio = export_audio(&mic, &system, &audio_out, format);
                 let tracks = export_tracks(&mic, &system, &audio_out);
-                (audio, tracks)
+                (audio, tracks, crate::auto_record::enabled())
             })
             .await
-            .unwrap_or((false, false));
+            .unwrap_or((false, false, false));
             let manifest = Manifest {
                 title: this.title(),
                 started_at: this.started_at.get(),
@@ -2207,15 +2207,30 @@ impl Recorder {
                 chapters: Vec::new(),
                 chapters_by: None,
             };
+            let skip_transcription =
+                crate::auto_record::skip_short_transcription(saved.2, manifest.duration_secs);
             let _ = meeting::write(&out, &manifest);
             *this.manifest.borrow_mut() = Some(manifest);
             *this.result_dir.borrow_mut() = Some(out);
 
+            if skip_transcription {
+                if saved.0 && saved.1 {
+                    let _ = std::fs::remove_dir_all(&staging);
+                }
+                this.animation_since.set(None);
+                this.animation.set_running(false);
+                this.finished_with_notice(
+                    saved.0,
+                    Ok(()),
+                    Some("Transcription skipped: recording was under one minute with auto-start enabled. You can transcribe it manually."),
+                );
+                return;
+            }
             let result = this
                 .run_transcription(Tracks::Raw(staging.clone()), language)
                 .await;
             // The kept tracks are enough to transcribe again; the raw files can go.
-            if saved == (true, true) {
+            if saved.0 && saved.1 {
                 let _ = std::fs::remove_dir_all(&staging);
             }
             this.hold_animation(&result).await;
@@ -2404,6 +2419,15 @@ impl Recorder {
     }
 
     fn finished(self: &Rc<Self>, audio_ok: bool, transcript: Result<(), String>) {
+        self.finished_with_notice(audio_ok, transcript, None);
+    }
+
+    fn finished_with_notice(
+        self: &Rc<Self>,
+        audio_ok: bool,
+        transcript: Result<(), String>,
+        notice: Option<&str>,
+    ) {
         self.done_title_row.set_text(&self.title_row.text());
         self.set_state(State::Done);
         // Follow a name that was edited while the transcription ran.
@@ -2425,12 +2449,20 @@ impl Recorder {
         if let Some(dir) = self.result_dir.borrow().as_ref() {
             self.player.load(dir);
         }
-        self.show_transcript(text.as_deref(), problem.as_deref());
+        self.show_transcript(text.as_deref(), problem.as_deref().or(notice));
+        if notice.is_some() && problem.is_none() {
+            self.done_icon.set_icon_name(Some("object-select-symbolic"));
+            self.window.set_default_widget(Some(&self.again_button));
+            self.again_button.grab_focus();
+        }
         self.transcript_scroll.vadjustment().set_value(0.0);
-        let actions_follow = problem.is_none() && !crate::actions::automatic().is_empty();
+        let actions_follow = problem.is_none()
+            && text.is_some()
+            && notice.is_none()
+            && !crate::actions::automatic().is_empty();
         if let Some(problem) = problem {
             eprintln!("{APP_NAME}: {problem}");
-        } else {
+        } else if text.is_some() {
             self.window.set_default_widget(Some(&self.copy_button));
             self.copy_button.grab_focus();
             // Your automatic actions run on a fresh transcript, after the
@@ -3348,7 +3380,7 @@ impl Recorder {
         let dialog = adw::AlertDialog::new(
             Some("Still recording"),
             Some(
-                "Closing stops the meeting. The audio is saved and transcribed first, then the window closes.",
+                "Closing stops the meeting and saves the audio before closing this window. Transcription is skipped for recordings under one minute when auto-start is enabled.",
             ),
         );
         dialog.add_response("keep", "Keep recording");

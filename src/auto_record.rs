@@ -332,6 +332,11 @@ fn systemctl(args: &[&str]) -> Result<(), String> {
     }
 }
 
+/// Use captured audio duration, so paused time does not count toward the minute.
+pub fn skip_short_transcription(auto_start_enabled: bool, duration_secs: i64) -> bool {
+    auto_start_enabled && duration_secs < 60
+}
+
 pub fn enabled() -> bool {
     systemctl(&["is-enabled", "--quiet", SERVICE]).is_ok()
 }
@@ -381,6 +386,18 @@ mod tests {
     fn web(code: &str) -> Value {
         serde_json::json!({"address":"0x1","class":"chromium","title":format!("Meet - {code} - Chromium")})
     }
+    #[test]
+    fn short_recordings_skip_transcription_only_with_auto_start_enabled() {
+        for seconds in [0, 1, 59] {
+            assert!(skip_short_transcription(true, seconds));
+            assert!(!skip_short_transcription(false, seconds));
+        }
+        for seconds in [60, 61, 7200] {
+            assert!(!skip_short_transcription(true, seconds));
+            assert!(!skip_short_transcription(false, seconds));
+        }
+    }
+
     #[test]
     fn replaced_executable_uses_installed_path() {
         let real = std::env::current_exe().unwrap();
